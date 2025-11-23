@@ -7,10 +7,11 @@ from typing import Dict, Any, Optional, Tuple
 import os
 import torch
 from torch.utils.data import DataLoader
+from torch.optim import AdamW  # <-- NEW: use PyTorch's AdamW
+
 from transformers import (
     T5ForConditionalGeneration,
     PreTrainedTokenizerBase,
-    AdamW,
     get_linear_schedule_with_warmup,
 )
 
