@@ -1,14 +1,9 @@
 # sft.py
-#
-# Supervised fine-tuning (SFT) utilities for FLAN-T5/T5 on summarization data.
-
 from typing import Dict, Any, Optional, Tuple
-
 import os
 import torch
 from torch.utils.data import DataLoader
-from torch.optim import AdamW  # <-- NEW: use PyTorch's AdamW
-
+from torch.optim import AdamW
 from transformers import (
     T5ForConditionalGeneration,
     PreTrainedTokenizerBase,
@@ -38,20 +33,15 @@ def evaluate_loss(
     dataloader: DataLoader,
     device: torch.device,
 ) -> float:
-    """Compute average loss over a dataloader."""
     model.eval()
     total_loss = 0.0
     n_batches = 0
-
     for batch in dataloader:
         batch = {k: v.to(device) for k, v in batch.items()}
         out = model(**batch)
         total_loss += out.loss.item()
         n_batches += 1
-
-    if n_batches == 0:
-        return 0.0
-    return total_loss / n_batches
+    return total_loss / max(n_batches, 1)
 
 
 def run_sft(
@@ -66,24 +56,6 @@ def run_sft(
     output_dir: Optional[str] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[T5ForConditionalGeneration, Dict[str, Any]]:
-    """
-    Run supervised fine-tuning on a tokenized summarization dataset.
-
-    Args:
-        train_dataset: tokenized train split (with input_ids/attention_mask/labels).
-        val_dataset: tokenized val split.
-        tokenizer: corresponding tokenizer (for saving alongside the model).
-        model_name: HF model name or local path for the base T5/FLAN-T5.
-        batch_size: per-device batch size.
-        num_epochs: number of passes over the train set.
-        lr: learning rate for AdamW.
-        warmup_ratio: fraction of steps used for LR warmup.
-        output_dir: if set, save the fine-tuned model + tokenizer here.
-        device: torch.device; if None, picks CUDA if available.
-
-    Returns:
-        (model, history) where history has simple loss logs.
-    """
     device = _get_device(device)
     print(f"[SFT] Using device: {device}")
 
@@ -100,10 +72,7 @@ def run_sft(
         num_training_steps=num_training_steps,
     )
 
-    history: Dict[str, Any] = {
-        "train_loss": [],
-        "val_loss": [],
-    }
+    history: Dict[str, Any] = {"train_loss": [], "val_loss": []}
 
     for epoch in range(num_epochs):
         model.train()
@@ -111,7 +80,6 @@ def run_sft(
 
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
-
             out = model(**batch)
             loss = out.loss
 
@@ -132,7 +100,6 @@ def run_sft(
 
         avg_train_loss = running_loss / max(len(train_loader), 1)
         avg_val_loss = evaluate_loss(model, val_loader, device)
-
         history["train_loss"].append(avg_train_loss)
         history["val_loss"].append(avg_val_loss)
 
