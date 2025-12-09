@@ -21,21 +21,33 @@ def preprocess_cnn_dm(
     tokenizer: PreTrainedTokenizerBase,
     max_input_len: int = 512,
     max_target_len: int = 128,
-):
-    prefix = "summarize: "
+) -> Tuple[Dataset, Dataset]:
+    prefix = "summarize: "  # helps T5/FLAN
 
     def _prep(batch):
+        # inputs
         inputs = [prefix + a for a in batch["article"]]
         enc = tokenizer(inputs, max_length=max_input_len, truncation=True, padding="max_length")
-        # modern way to tokenize targets (no as_target_tokenizer)
-        labels = tokenizer(text_target=batch["highlights"],
-                           max_length=max_target_len, truncation=True, padding="max_length")
+        # targets (modern API)
+        tgt = tokenizer(text_target=batch["highlights"],
+                        max_length=max_target_len, truncation=True, padding="max_length")
         pad_id = tokenizer.pad_token_id
-        enc["labels"] = [[(tid if tid != pad_id else -100) for tid in seq] for seq in labels["input_ids"]]
+        labels = [[(tid if tid != pad_id else -100) for tid in seq] for seq in tgt["input_ids"]]
+
+        # quick sanity: ensure not all -100 (empty targets)
+        # if empty, keep at least one token (rare but protective)
+        for i, seq in enumerate(labels):
+            if all(t == -100 for t in seq):
+                # keep first non-pad from tgt if exists, else set a dummy eos
+                seq[0] = tgt["input_ids"][i][0] if tgt["input_ids"][i] else tokenizer.eos_token_id
+                labels[i] = seq
+
+        enc["labels"] = labels
         return enc
 
     train_tok = train_ds.map(_prep, batched=True, remove_columns=train_ds.column_names)
     val_tok   = val_ds.map(_prep,   batched=True, remove_columns=val_ds.column_names)
+
     cols = ["input_ids", "attention_mask", "labels"]
     train_tok.set_format(type="torch", columns=cols)
     val_tok.set_format(type="torch", columns=cols)
