@@ -26,16 +26,16 @@ def preprocess_cnn_dm(
 
     def _prep(batch):
         inputs = [prefix + a for a in batch["article"]]
-        model_inputs = tokenizer(inputs, max_length=max_input_len, truncation=True, padding="max_length")
-        with tokenizer.as_target_tokenizer():
-            labels = tokenizer(batch["highlights"], max_length=max_target_len, truncation=True, padding="max_length")
+        enc = tokenizer(inputs, max_length=max_input_len, truncation=True, padding="max_length")
+        # modern way to tokenize targets (no as_target_tokenizer)
+        labels = tokenizer(text_target=batch["highlights"],
+                           max_length=max_target_len, truncation=True, padding="max_length")
         pad_id = tokenizer.pad_token_id
-        labels_ids = [[(tid if tid != pad_id else -100) for tid in seq] for seq in labels["input_ids"]]
-        model_inputs["labels"] = labels_ids
-        return model_inputs
+        enc["labels"] = [[(tid if tid != pad_id else -100) for tid in seq] for seq in labels["input_ids"]]
+        return enc
 
     train_tok = train_ds.map(_prep, batched=True, remove_columns=train_ds.column_names)
-    val_tok = val_ds.map(_prep, batched=True, remove_columns=val_ds.column_names)
+    val_tok   = val_ds.map(_prep,   batched=True, remove_columns=val_ds.column_names)
     cols = ["input_ids", "attention_mask", "labels"]
     train_tok.set_format(type="torch", columns=cols)
     val_tok.set_format(type="torch", columns=cols)
