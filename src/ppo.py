@@ -56,7 +56,6 @@ def run_ppo(
     model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(model_name).to(device)
 
     cfg = PPOConfig(
-        model_name=model_name,
         learning_rate=lr,
         batch_size=batch_size,
         mini_batch_size=batch_size,
