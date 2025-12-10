@@ -5,9 +5,15 @@ import dataclasses
 import torch
 from datasets import load_dataset
 from transformers import T5Tokenizer
-from trl import PPOConfig, PPOTrainer, AutoModelForSeq2SeqLMWithValueHead
 
-# Tolerate both import styles: PYTHONPATH=src OR importing as src.ppo
+# --- TRL imports: prefer experimental, fallback to classic ---
+try:
+    from trl.experimental.ppo import PPOConfig as _PPOConfig, PPOTrainer as _PPOTrainer
+    from trl import AutoModelForSeq2SeqLMWithValueHead
+except Exception:
+    from trl import PPOConfig as _PPOConfig, PPOTrainer as _PPOTrainer, AutoModelForSeq2SeqLMWithValueHead
+
+# --- rewards import works both with PYTHONPATH=src and src. prefix ---
 try:
     from rewards import rouge_l_rewards
 except ModuleNotFoundError:
@@ -45,10 +51,9 @@ def build_ppo_dataset(
 
 def _build_version_safe_ppo_config(
     *, lr: float, batch_size: int, ppo_epochs: int, target_kl: float, seed: int
-) -> PPOConfig:
+) -> _PPOConfig:
     """
-    Create a PPOConfig but only include fields supported by the installed TRL version.
-    This avoids errors like: '__init__() got an unexpected keyword argument ...'
+    Create a PPOConfig including only fields supported by the installed TRL version.
     """
     wanted = dict(
         learning_rate=lr,
@@ -60,9 +65,23 @@ def _build_version_safe_ppo_config(
         target_kl=target_kl,
         seed=seed,
     )
-    allowed = {f.name for f in dataclasses.fields(PPOConfig)}
+    allowed = {f.name for f in dataclasses.fields(_PPOConfig)}
     safe_kwargs = {k: v for k, v in wanted.items() if k in allowed}
-    return PPOConfig(**safe_kwargs)
+    return _PPOConfig(**safe_kwargs)
+
+
+def _make_trainer(cfg: _PPOConfig, model, tokenizer):
+    """
+    Instantiate PPOTrainer with whatever signature this TRL build expects.
+    Tries (config=...), then (ppo_config=...), then positional.
+    """
+    try:
+        return _PPOTrainer(config=cfg, model=model, ref_model=None, tokenizer=tokenizer, dataset=None)
+    except TypeError:
+        try:
+            return _PPOTrainer(ppo_config=cfg, model=model, ref_model=None, tokenizer=tokenizer, dataset=None)
+        except TypeError:
+            return _PPOTrainer(cfg, model, None, tokenizer=tokenizer, dataset=None)
 
 
 def run_ppo(
@@ -82,7 +101,7 @@ def run_ppo(
     device: Optional[str] = None,
 ) -> str:
     """
-    PPO fine-tuning entrypoint. Trains a value-headed seq2seq policy with ROUGE-L rewards.
+    PPO fine-tuning for summarization with ROUGE-L rewards.
     Saves model + tokenizer to `out_dir` and returns that path.
     """
     if device is None:
@@ -92,29 +111,23 @@ def run_ppo(
     if device == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    # Load tokenizer & policy (policy-with-value head)
+    # Tokenizer & value-headed policy
     tokenizer = T5Tokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(model_name).to(device)
 
-    # Build version-safe PPO config
+    # Version-safe PPO config
     cfg = _build_version_safe_ppo_config(
         lr=lr, batch_size=batch_size, ppo_epochs=ppo_epochs, target_kl=target_kl, seed=seed
     )
 
-    # PPO trainer (ref model auto-cloned if None)
-    ppo_trainer = PPOTrainer(
-        config=cfg,
-        model=model,
-        ref_model=None,
-        tokenizer=tokenizer,
-        dataset=None,  # we feed batches manually
-    )
+    # Trainer (ref model auto-cloned if None)
+    ppo_trainer = _make_trainer(cfg, model, tokenizer)
 
-    # Build small dataset
+    # Data
     data = build_ppo_dataset(n_train=n_train, use_instruction=use_instruction)
-
-    # Use the explicit batch_size we passed (not cfg.batch_size; safer across TRL versions)
-    effective_bs = batch_size
+    effective_bs = batch_size  # don't rely on cfg.batch_size existing in all TRL versions
 
     for ep in range(epochs):
         print(f"\n=== PPO Epoch {ep + 1}/{epochs} ===")
