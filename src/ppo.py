@@ -274,7 +274,6 @@ def run_ppo(
 
             # Auto-tighten on negative KL (optional)
             if auto_tighten_on_neg_kl and isinstance(kl, float) and kl < 0.0:
-                # Tighten sampling a notch for the next step
                 gen_kwargs["top_p"] = max(0.45, float(gen_kwargs["top_p"]) - 0.05)
                 gen_kwargs["temperature"] = max(0.5, float(gen_kwargs["temperature"]) - 0.05)
 
