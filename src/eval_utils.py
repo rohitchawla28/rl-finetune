@@ -60,8 +60,18 @@ def _repetition_rate(text: str) -> float:
     return 0.0 if len(toks) <= 1 else 1.0 - (len(set(toks)) / len(toks))
 
 
-def metrics_table(preds: List[str], refs: List[str]) -> dict:
-    """ROUGE (+ BLEU, compression, repetition) in one dict."""
+def metrics_table(preds: List[str], refs: List[str], save_path: Optional[str] = None) -> dict:
+    """
+    ROUGE (+ BLEU, compression, repetition) in one dict.
+    
+    Args:
+        preds: List of prediction strings
+        refs: List of reference strings
+        save_path: Optional path to save results as JSON
+    
+    Returns:
+        Dictionary of metrics
+    """
     r = _ROUGE.compute(predictions=preds, references=refs)
     b = _BLEU.compute(predictions=preds, references=[[x] for x in refs])
     lens_pred = np.array([len(p.split()) for p in preds])
@@ -69,6 +79,14 @@ def metrics_table(preds: List[str], refs: List[str]) -> dict:
     compression = float(np.mean(lens_pred / np.maximum(1, lens_ref)))
     repetition  = float(np.mean([_repetition_rate(p) for p in preds]))
     r.update({"bleu": b["bleu"], "compression": compression, "repetition": repetition})
+    
+    if save_path:
+        import json
+        import os
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+        with open(save_path, 'w') as f:
+            json.dump(r, f, indent=2)
+    
     return r
 
 
@@ -85,10 +103,18 @@ def eval_model(
     max_new_tokens: int = 128,
     tokenizer_class=None,
     model_class=None,
+    save_path: Optional[str] = None,
 ) -> dict:
     """
     Convenience: load -> generate_batched -> metrics_table.
     By default uses T5Tokenizer/T5ForConditionalGeneration so local PPO/SFT checkpoints load cleanly.
+    
+    Args:
+        model_id_or_path: Model path or HuggingFace model ID
+        eval_ds: Evaluation dataset
+        text_key: Key for input text (default "article" for CNN/DM, "document" for XSum)
+        ref_key: Key for reference (default "highlights" for CNN/DM, "summary" for XSum)
+        save_path: Optional path to save results JSON
     """
     Tok = tokenizer_class or T5Tokenizer
     Mdl = model_class or T5ForConditionalGeneration
@@ -104,4 +130,4 @@ def eval_model(
         max_new_tokens=max_new_tokens,
         num_beams=num_beams,
     )
-    return metrics_table(preds, refs)
+    return metrics_table(preds, refs, save_path=save_path)

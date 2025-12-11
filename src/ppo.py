@@ -5,6 +5,7 @@ PPO for CNN/DailyMail summarization with TRL-generate compatibility.
 - Filters-by-length FIRST, then shuffle/select n_train
 - Uses PPOTrainer.generate(...) (new or old signature) to keep policy/ref aligned
 - Ensures attention_mask is 2-D for T5 (fixes IndexError)
+- Flattens responses to 1-D id lists before batch_decode (fixes TypeError)
 - Safe generation defaults; reward clamp; optional CSV logging
 """
 
@@ -15,7 +16,6 @@ from transformers import T5Tokenizer
 from trl import PPOConfig, PPOTrainer, AutoModelForSeq2SeqLMWithValueHead
 from tqdm.auto import tqdm
 
-# Rewards import (repo-local or package layout)
 try:
     from rewards import rouge_l_rewards
 except ModuleNotFoundError:
@@ -53,45 +53,48 @@ def _ensure_2d_mask(am: Optional[torch.Tensor], i: Optional[int] = None) -> Opti
     m = am[i]
     return m if m.ndim == 2 else m.unsqueeze(0)
 
+def _to_1d_id_list(x):
+    """Normalize any response (tensor or nested list) to a flat 1-D list[int]."""
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+        if x.ndim == 2 and x.size(0) == 1:
+            x = x.squeeze(0)
+        elif x.ndim > 2:
+            x = x.view(-1)
+        return x.tolist()
+    # list/tuple path: peel leading singleton dims ([[ids]] -> [ids])
+    while isinstance(x, (list, tuple)) and len(x) > 0 and isinstance(x[0], (list, tuple)):
+        x = x[0]
+    return list(x)
+
 def _ppo_generate(ppo_trainer: PPOTrainer, enc: Dict[str, torch.Tensor], **gen_kwargs):
     """
-    Compatibility wrapper for TRL generate across versions:
-      - Newer TRL:  generate(query_tensors=[...], attention_mask=[B,T])
-      - Older TRL:  generate(query_tensor=...,   attention_mask=[1,T]) per-sample
-    Returns list[tensor] (one decoded response per example).
+    Optimized generation: Use model directly for faster batched generation.
+    TRL's generate can be slow, so we bypass it and use the underlying model.
+    Returns list[tensor] (one response per example) - only generated tokens.
     """
-    sig = inspect.signature(ppo_trainer.generate)
-    am = enc.get("attention_mask", None)
-
-    if "query_tensors" in sig.parameters:
-        gens = ppo_trainer.generate(
-            query_tensors=[row for row in enc["input_ids"]],
-            attention_mask=_ensure_2d_mask(am, None),  # [B,T]
-            return_prompt=False,
+    # Use the model directly for faster batched generation
+    model = ppo_trainer.model
+    if hasattr(model, 'pretrained_model'):
+        model = model.pretrained_model  # Unwrap value head to get base model
+    
+    model.eval()
+    with torch.no_grad():
+        # Generate directly - much faster than TRL's generate
+        # For T5, generate() returns full sequence (input + generated)
+        outputs = model.generate(
+            input_ids=enc["input_ids"],
+            attention_mask=enc.get("attention_mask", None),
             **gen_kwargs,
         )
-        # TRL may return a single padded tensor [B,T]; normalize to list
-        if torch.is_tensor(gens):
-            return [row for row in gens]
-        return list(gens)
-
-    # Older API: per-sample path, ensure mask is [1,T]
-    outs = []
-    B = enc["input_ids"].size(0)
-    for i in range(B):
-        q = enc["input_ids"][i]
-        g = ppo_trainer.generate(
-            query_tensor=q,
-            attention_mask=_ensure_2d_mask(am, i),  # [1,T]
-            return_prompt=False,
-            **gen_kwargs,
-        )
-        if isinstance(g, list):
-            if not g:
-                continue
-            g = g[0]
-        outs.append(g)
-    return outs
+    
+    # Extract only the generated tokens (remove input prompt)
+    # T5 generate returns [input_ids, generated_ids], so we slice
+    input_len = enc["input_ids"].shape[1]
+    generated = outputs[:, input_len:].contiguous()
+    
+    # Return as list of tensors (one per example)
+    return [generated[i] for i in range(generated.size(0))]
 
 
 # ----------------------------
@@ -101,24 +104,23 @@ def run_ppo(
     model_name: str = "google/flan-t5-small",
     out_dir: str = "checkpoints/flan_t5_ppo_from_base",
 
-    # You can pass prebuilt {query, reference} pairs to bypass internal loading
-    pairs: Optional[List[Dict[str, str]]] = None,
+    pairs: Optional[List[Dict[str, str]]] = None,  # optional prebuilt {query, reference}
 
-    # Data controls (used only if `pairs` is None)
+    # data controls (used only if pairs is None)
     n_train: int = 300,
     min_len: int = 200,
     max_len: int = 1200,
     use_instruction: bool = False,
     seed: int = 42,
 
-    # Batching / schedule
+    # schedule
     batch_size: int = 4,
-    steps_per_epoch: Optional[int] = None,   # if None -> ceil(len(data)/bs)
+    steps_per_epoch: Optional[int] = None,   # None => ceil(len(data)/bs)
     epochs: int = 1,
     remainder: Literal["skip", "wrap"] = "skip",
 
-    # Generation (safe defaults)
-    max_new_tokens: int = 56,
+    # generation (safe defaults)
+    max_new_tokens: int = 64,
     min_new_tokens: int = 8,
     no_repeat_ngram_size: int = 4,
     top_k: int = 30,
@@ -128,7 +130,7 @@ def run_ppo(
     # PPO knobs
     lr: float = 1e-6,
     ppo_epochs: int = 2,
-    target_kl: float = 0.08,
+    target_kl: float = 0.1,
     cliprange: float = 0.2,
     cliprange_value: float = 0.2,
     max_grad_norm: float = 1.0,
@@ -136,18 +138,18 @@ def run_ppo(
     adap_kl_ctrl: bool = True,
     init_kl_coef: float = 0.4,
 
-    # Rewards
+    # rewards
     length_penalty: float = 0.0,
-    reward_clamp: float = 0.5,   # clamp each reward to [-0.5, 0.5]
+    reward_clamp: float = 1.0,  # Less aggressive clamping
     reward_fn=None,
     reward_kwargs: Optional[dict] = None,
 
-    # Logging / output
+    # logging
     verbosity: Literal["silent", "summary", "steps"] = "summary",
     tqdm_bar: bool = True,
     log_csv: Optional[str] = None,
 
-    # Misc
+    # misc
     device: Optional[str] = None,
 ) -> str:
     device = _device_str(device)
@@ -155,17 +157,22 @@ def run_ppo(
     if device == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    # Verbosity
     LVL = {"silent": 0, "summary": 1, "steps": 2}
     V = LVL[verbosity]
 
-    # Tokenizer & policy/value (fp32 for stability)
+    # tokenizer + policy/value (fp32 for stability)
     tokenizer = T5Tokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load policy model (with value head for PPO)
     model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(model_name).to(device)
+    
+    # Reference model: TRL will use the initial policy model state as reference
+    # when ref_model=None. This is the standard approach and avoids needing
+    # a separate wrapped model.
+    ref_model = None
 
-    # TRL config (0.10.1)
     cfg = PPOConfig(
         model_name=model_name,
         learning_rate=lr,
@@ -183,9 +190,9 @@ def run_ppo(
         seed=seed,
         optimize_cuda_cache=True,
     )
-    ppo_trainer = PPOTrainer(cfg, model, ref_model=None, tokenizer=tokenizer, dataset=None)
+    ppo_trainer = PPOTrainer(cfg, model, ref_model=ref_model, tokenizer=tokenizer, dataset=None)
 
-    # Data
+    # data
     if pairs is None:
         raw = load_dataset("cnn_dailymail", "3.0.0", split="train")
         raw = _filter_by_len(raw, min_len=min_len, max_len=max_len)
@@ -207,18 +214,17 @@ def run_ppo(
             print(f"[PPO] using provided pairs n={len(data)}")
 
     data_len = len(data)
-    # Schedule
     auto_steps = math.ceil(data_len / batch_size)
     steps_per_epoch = auto_steps if steps_per_epoch is None else min(steps_per_epoch, auto_steps)
     if V >= 1:
         print(f"[PPO] device={device} n_train={data_len} epochs={epochs} steps/epoch={steps_per_epoch} bs={batch_size}")
 
-    # Reward fn
+    # rewards
     if reward_fn is None:
         reward_fn = lambda preds, refs, **kw: rouge_l_rewards(preds, refs, length_penalty=length_penalty)
     rw_kwargs = reward_kwargs or {}
 
-    # Generation kwargs (passed to TRL)
+    # gen kwargs (passed to TRL)
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         min_new_tokens=min_new_tokens,
@@ -268,28 +274,113 @@ def run_ppo(
             queries = [ex["query"] for ex in batch]
             refs    = [ex["reference"] for ex in batch]
 
-            # Encode
-            enc = tokenizer(
-                queries, return_tensors="pt", padding=True, truncation=True, max_length=512
-            ).to(device)
+            # encode
+            enc = tokenizer(queries, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
             _safe_isfinite("queries/input_ids", enc["input_ids"])
 
-            # Generate (signature-safe + mask 2-D)
+            # generate via TRL (signature-safe)
             responses = _ppo_generate(ppo_trainer, enc, **gen_kwargs)   # -> list[tensor]
             for i, r in enumerate(responses):
                 _safe_isfinite(f"responses[{i}]", r)
 
-            # Decode texts (accept list[List[int]] or list[tensor])
-            decode_in = [r.tolist() if torch.is_tensor(r) else r for r in responses]
+            # decode texts (force 1-D id lists)
+            decode_in = [_to_1d_id_list(r) for r in responses]
             response_texts = tokenizer.batch_decode(decode_in, skip_special_tokens=True)
+            
+            # Filter out empty generations and handle them
+            valid_indices = []
+            valid_texts = []
+            valid_refs = []
+            valid_queries = []
+            valid_responses = []
+            valid_enc_input_ids = []
+            
+            for i, (txt, ref, q, resp) in enumerate(zip(response_texts, refs, queries, responses)):
+                if txt and txt.strip():  # Non-empty text
+                    valid_indices.append(i)
+                    valid_texts.append(txt)
+                    valid_refs.append(ref)
+                    valid_queries.append(q)
+                    valid_responses.append(resp)
+                    valid_enc_input_ids.append(enc["input_ids"][i])
+            
+            if not valid_texts:
+                if V >= 2:
+                    print(f"[PPO] Warning: All generations empty at step {step_idx}, skipping batch")
+                if pbar is not None:
+                    pbar.update(1)
+                continue
+            
+            # Check if we have enough valid examples for the batch size
+            if len(valid_texts) < batch_size:
+                if V >= 2:
+                    print(f"[PPO] Warning: Only {len(valid_texts)} valid examples after filtering (need {batch_size}), skipping batch")
+                if pbar is not None:
+                    pbar.update(1)
+                continue
+            
+            # Only process valid examples
+            if len(valid_texts) < len(response_texts):
+                if V >= 2:
+                    print(f"[PPO] Warning: {len(response_texts) - len(valid_texts)} empty generations at step {step_idx}")
+                # Update to only valid examples
+                queries = valid_queries
+                responses = valid_responses
+                refs = valid_refs
+                response_texts = valid_texts
+                # Re-encode only valid queries
+                enc = tokenizer(queries, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+            
+            # Extract 1D query tensors (enc["input_ids"] is [batch_size, seq_len], so [i] gives 1D)
+            # Ensure they're on the correct device and have consistent dtype
+            query_tensors = []
+            for i in range(enc["input_ids"].size(0)):
+                q = enc["input_ids"][i].clone().to(device)
+                query_tensors.append(q)
 
-            # Rewards
+            # Ensure responses are 1D tensors (list of tensors, each 1D)
+            # All must be on same device with consistent dtype
+            response_tensors = []
+            for resp in responses:
+                if torch.is_tensor(resp):
+                    # Flatten to 1D if needed
+                    if resp.ndim == 0:
+                        resp = resp.unsqueeze(0)
+                    elif resp.ndim > 1:
+                        resp = resp.view(-1)
+                    # Ensure correct device and dtype
+                    resp = resp.clone().detach().to(device).long()
+                    response_tensors.append(resp)
+                elif isinstance(resp, (list, tuple)):
+                    # Convert list to 1D tensor
+                    response_tensors.append(torch.tensor(resp, dtype=torch.long, device=device))
+                else:
+                    # Single value
+                    response_tensors.append(torch.tensor([resp], dtype=torch.long, device=device))
+
+            # Final safety check: ensure we have exactly batch_size examples
+            if len(query_tensors) != batch_size or len(response_tensors) != batch_size:
+                if V >= 2:
+                    print(f"[PPO] Warning: Mismatch - queries={len(query_tensors)}, responses={len(response_tensors)}, batch_size={batch_size}, skipping")
+                if pbar is not None:
+                    pbar.update(1)
+                continue
+
+            # rewards
             rewards = reward_fn(response_texts, refs, **rw_kwargs)
             rewards = [torch.clamp(r.float(), -reward_clamp, reward_clamp) for r in rewards]
             rewards = [torch.where(torch.isfinite(r), r, torch.zeros_like(r)) for r in rewards]
+            
+            # Final check: rewards must match batch size
+            if len(rewards) != batch_size:
+                if V >= 2:
+                    print(f"[PPO] Warning: Rewards count ({len(rewards)}) != batch_size ({batch_size}), skipping")
+                if pbar is not None:
+                    pbar.update(1)
+                continue
 
-            # PPO update
-            stats = ppo_trainer.step([q for q in enc["input_ids"]], responses, rewards)
+            # PPO update - pass 1D tensors
+            stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
             mean_reward = torch.stack(rewards).mean().item()
             kl = _pick(stats, "objective/kl", "ppo/policy/kl", "kl")
             pol_loss = _pick(stats, "ppo/loss/policy", "train/mean_policy_loss", "ppo/mean_policy_loss")
@@ -321,7 +412,7 @@ def run_ppo(
     if csv_f is not None:
         csv_f.close()
 
-    # Save
+    # save
     os.makedirs(out_dir, exist_ok=True)
     ppo_trainer.model.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
