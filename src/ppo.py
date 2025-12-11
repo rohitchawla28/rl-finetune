@@ -91,9 +91,17 @@ def _ppo_generate(ppo_trainer: PPOTrainer, enc: Dict[str, torch.Tensor], **gen_k
     # Extract only the generated tokens (remove input prompt)
     # T5 generate returns [input_ids, generated_ids], so we slice
     input_len = enc["input_ids"].shape[1]
+    output_len = outputs.shape[1]
+    
+    # Handle case where output is same length as input (no generation happened)
+    if output_len <= input_len:
+        # Return empty tensors - this will be filtered out later
+        return [torch.tensor([], dtype=torch.long, device=outputs.device) for _ in range(outputs.size(0))]
+    
     generated = outputs[:, input_len:].contiguous()
     
     # Return as list of tensors (one per example)
+    # Let decoding handle special tokens - don't filter here
     return [generated[i] for i in range(generated.size(0))]
 
 
@@ -286,6 +294,15 @@ def run_ppo(
             # decode texts (force 1-D id lists)
             decode_in = [_to_1d_id_list(r) for r in responses]
             response_texts = tokenizer.batch_decode(decode_in, skip_special_tokens=True)
+            
+            # Debug: Print generation info on first step
+            if step_idx == 1 and V >= 2:
+                print(f"[PPO DEBUG] Generated {len(responses)} responses")
+                for i, (resp_tensor, txt) in enumerate(zip(responses, response_texts)):
+                    resp_len = len(resp_tensor) if isinstance(resp_tensor, torch.Tensor) else len(resp_tensor)
+                    print(f"  Response {i}: len={resp_len}, text_len={len(txt)}, preview='{txt[:50]}...'")
+                    if resp_len > 0:
+                        print(f"    First 5 tokens: {resp_tensor[:5] if isinstance(resp_tensor, torch.Tensor) else resp_tensor[:5]}")
             
             # Filter out empty generations and handle them
             valid_indices = []

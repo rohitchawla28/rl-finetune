@@ -1,5 +1,6 @@
-# Markdown documentation files
+# Markdown documentation files and notebooks
 *.md
+*.md.ipynb
 
 # Fully commented/example Python files (documentation/notebook templates)
 improved_experiment_notebook.py
