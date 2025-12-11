@@ -30,16 +30,28 @@ def build_scst_dataset(
     min_len: int = 200,
     max_len: int = 1200,
     seed: int = 42,
+    dataset_name: str = "cnn_dailymail",
 ) -> List[Dict[str, str]]:
     """
-    Returns a list of {"article": <text>, "reference": <gold summary>} from CNN/DM train.
+    Returns a list of {"article": <text>, "reference": <gold summary>} from dataset.
+    Supports both CNN/DM and XSum.
     """
-    raw = load_dataset("cnn_dailymail", "3.0.0", split="train").shuffle(seed=seed).select(range(n_train))
-    def ok(ex):
-        L = len(ex["article"])
-        return (L >= min_len) and (L <= max_len)
-    raw = raw.filter(ok)
-    return [{"article": ex["article"], "reference": ex["highlights"]} for ex in raw]
+    if dataset_name == "cnn_dailymail":
+        raw = load_dataset("cnn_dailymail", "3.0.0", split="train").shuffle(seed=seed).select(range(n_train))
+        def ok(ex):
+            L = len(ex["article"])
+            return (L >= min_len) and (L <= max_len)
+        raw = raw.filter(ok)
+        return [{"article": ex["article"], "reference": ex["highlights"]} for ex in raw]
+    elif dataset_name == "xsum":
+        raw = load_dataset("xsum", split="train").shuffle(seed=seed).select(range(n_train))
+        def ok(ex):
+            L = len(ex["document"])
+            return (L >= min_len) and (L <= max_len)
+        raw = raw.filter(ok)
+        return [{"article": ex["document"], "reference": ex["summary"]} for ex in raw]
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
 # ---------- Rewards (ROUGE-L per example) ----------
 
@@ -208,6 +220,10 @@ def run_scst(
     # reward shaping
     advantage_normalize: bool = True,
     reward_clip: Optional[float] = 0.5,  # clip absolute advantage
+    # dataset
+    dataset_name: str = "cnn_dailymail",
+    min_len: int = 200,
+    max_len: int = 1200,
     # misc
     seed: int = 42,
     debug: bool = True,
@@ -222,7 +238,13 @@ def run_scst(
 
     model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
 
-    data = build_scst_dataset(n_train=n_train, seed=seed)
+    data = build_scst_dataset(
+        n_train=n_train, 
+        seed=seed,
+        dataset_name=dataset_name,
+        min_len=min_len,
+        max_len=max_len,
+    )
     dl = DataLoader(data, batch_size=batch_size, shuffle=True)
 
     # simple linear warmup + decay on token updates

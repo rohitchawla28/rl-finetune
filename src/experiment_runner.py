@@ -19,6 +19,7 @@ from src.rewards import (
     redundancy_penalty,
 )
 from src.ppo import run_ppo
+from src.scst import run_scst
 from src.eval_utils import eval_model, generate_summaries_batched, metrics_table
 
 
@@ -235,4 +236,114 @@ def compare_all_results(results_dir: str = "./results", output_file: Optional[st
         print(f"\nSaved comparison to {output_file}")
     
     return df
+
+
+def run_scst_experiment(
+    exp_config: Dict[str, Any],
+    base_model_path: str,
+    sft_model_path: Optional[str],
+    eval_dataset,
+    dataset_name: str,
+    results_dir: str = "./results",
+    verbosity: str = "summary",
+) -> Dict[str, Any]:
+    """
+    Run a single SCST experiment.
+    
+    Args:
+        exp_config: Experiment configuration
+        base_model_path: Path to base model
+        sft_model_path: Path to SFT model (if starting from SFT)
+        eval_dataset: Evaluation dataset
+        dataset_name: Name of dataset (for field keys)
+        results_dir: Directory to save results
+        verbosity: Verbosity level
+    
+    Returns:
+        Dictionary with experiment results
+    """
+    exp_name = exp_config["name"]
+    print(f"\n{'='*70}")
+    print(f"Running SCST Experiment: {exp_name}")
+    print(f"{'='*70}")
+    
+    # Get starting model
+    if exp_config["from"] == "base":
+        start_path = base_model_path
+    elif exp_config["from"] == "sft":
+        if sft_model_path is None:
+            raise ValueError("SFT model path required but not provided")
+        start_path = sft_model_path
+    else:
+        raise ValueError(f"Unknown starting point: {exp_config['from']}")
+    
+    # Create output directory
+    out_dir = os.path.join(results_dir, "checkpoints", exp_name)
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Run SCST
+    try:
+        scst_dir = run_scst(
+            model_name=start_path,
+            out_dir=out_dir,
+            n_train=exp_config.get("n_train", 2000),
+            batch_size=exp_config.get("batch_size", 8),
+            epochs=exp_config.get("epochs", 1),
+            lr=exp_config.get("lr", 1e-6),
+            warmup_ratio=exp_config.get("warmup_ratio", 0.1),
+            greedy_beams=exp_config.get("greedy_beams", 4),
+            greedy_max_new=exp_config.get("greedy_max_new", 64),
+            sample_max_new=exp_config.get("sample_max_new", 64),
+            sample_min_new=exp_config.get("sample_min_new", 8),
+            top_k=exp_config.get("top_k", 30),
+            top_p=exp_config.get("top_p", 0.8),
+            temperature=exp_config.get("temperature", 0.7),
+            no_repeat_ngram_size=exp_config.get("no_repeat_ngram_size", 4),
+            max_input_len=exp_config.get("max_input_len", 512),
+            max_target_len=exp_config.get("max_target_len", 128),
+            advantage_normalize=exp_config.get("advantage_normalize", True),
+            reward_clip=exp_config.get("reward_clip", 0.5),
+            dataset_name=dataset_name,
+            min_len=exp_config.get("min_len", 200),
+            max_len=exp_config.get("max_len", 1200),
+            seed=exp_config.get("seed", 42),
+            debug=(verbosity == "steps"),
+        )
+        
+        # Evaluate
+        text_key, ref_key = get_dataset_keys(dataset_name)
+        results_path = os.path.join(results_dir, f"results_{exp_name}.json")
+        scores = eval_model(
+            scst_dir,
+            eval_dataset,
+            text_key=text_key,
+            ref_key=ref_key,
+            save_path=results_path,
+        )
+        
+        print(f"\n[Results for {exp_name}]")
+        print(f"  ROUGE-1: {scores['rouge1']:.4f}")
+        print(f"  ROUGE-2: {scores['rouge2']:.4f}")
+        print(f"  ROUGE-L: {scores['rougeL']:.4f}")
+        print(f"  BLEU: {scores['bleu']:.4f}")
+        print(f"  Compression: {scores['compression']:.4f}")
+        print(f"  Repetition: {scores['repetition']:.4f}")
+        
+        return {
+            "experiment": exp_name,
+            "checkpoint_dir": scst_dir,
+            "results_path": results_path,
+            "scores": scores,
+            "success": True,
+        }
+    
+    except Exception as e:
+        print(f"\n[ERROR] Experiment {exp_name} failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "experiment": exp_name,
+            "success": False,
+            "error": str(e),
+        }
 
