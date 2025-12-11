@@ -382,11 +382,23 @@ def run_ppo(
             # PPO update - pass 1D tensors
             stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
             mean_reward = torch.stack(rewards).mean().item()
+            
+            # Debug: Print stats on first and last step to verify training
+            if step_idx == 1 and V >= 1:
+                reward_std = torch.stack(rewards).std().item()
+                print(f"[PPO] Step 1: mean_reward={mean_reward:.4f}, std={reward_std:.4f}")
+            
             kl = _pick(stats, "objective/kl", "ppo/policy/kl", "kl")
             pol_loss = _pick(stats, "ppo/loss/policy", "train/mean_policy_loss", "ppo/mean_policy_loss")
             val_loss = _pick(stats, "ppo/loss/value", "train/mean_value_loss", "ppo/mean_value_loss")
             ent = _pick(stats, "ppo/policy/entropy", "policy/entropy")
             kl_coef = _pick(stats, "ppo/kl_coef", "train/kl_coef")
+            
+            # Debug: Verify training is happening
+            if step_idx == 1 and V >= 1:
+                print(f"[PPO] Step 1 training: kl={kl:.4f}, policy_loss={pol_loss:.4f}, entropy={ent:.4f}")
+            if step_idx == steps_per_epoch and V >= 1:
+                print(f"[PPO] Step {step_idx} (final): kl={kl:.4f}, policy_loss={pol_loss:.4f}, entropy={ent:.4f}")
 
             if V >= 2:
                 print(f"[step {step_idx}] reward={mean_reward:.4f} kl={kl:.4f} "
@@ -414,7 +426,19 @@ def run_ppo(
 
     # save
     os.makedirs(out_dir, exist_ok=True)
-    ppo_trainer.model.save_pretrained(out_dir)
+    # CRITICAL: Extract the pretrained model (without value head) for saving
+    # The value head is only for PPO training, we want to save the actual language model
+    if hasattr(ppo_trainer.model, 'pretrained_model'):
+        # Save the base model (this is what gets updated during PPO)
+        base_model = ppo_trainer.model.pretrained_model
+        base_model.save_pretrained(out_dir)
+        if V >= 1:
+            print(f"[PPO] Saved pretrained model (without value head) to {out_dir}")
+    else:
+        # Fallback: save full model if structure is different
+        ppo_trainer.model.save_pretrained(out_dir)
+        if V >= 1:
+            print(f"[PPO] Saved full model to {out_dir}")
     tokenizer.save_pretrained(out_dir)
     with open(os.path.join(out_dir, "ppo_run_config.json"), "w") as f:
         json.dump({
