@@ -10,6 +10,12 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+# Import eval utilities for metrics
+try:
+    from src.eval_utils import generate_summaries_batched, metrics_table
+except ImportError:
+    from eval_utils import generate_summaries_batched, metrics_table
+
 
 def _get_device(device: Optional[torch.device] = None) -> torch.device:
     if device is not None:
@@ -55,6 +61,15 @@ def run_sft(
     warmup_ratio: float = 0.1,
     output_dir: Optional[str] = None,
     device: Optional[torch.device] = None,
+    # Evaluation parameters
+    eval_dataset: Optional[Any] = None,
+    text_key: str = "article",
+    ref_key: str = "highlights",
+    eval_batch_size: int = 16,
+    eval_max_input_len: int = 512,
+    eval_max_new_tokens: int = 128,
+    eval_num_beams: int = 4,
+    print_metrics: bool = True,
 ) -> Tuple[T5ForConditionalGeneration, Dict[str, Any]]:
     device = _get_device(device)
     print(f"[SFT] Using device: {device}")
@@ -72,7 +87,11 @@ def run_sft(
         num_training_steps=num_training_steps,
     )
 
-    history: Dict[str, Any] = {"train_loss": [], "val_loss": []}
+    history: Dict[str, Any] = {
+        "train_loss": [],
+        "val_loss": [],
+        "metrics": []  # Store metrics for each epoch
+    }
 
     for epoch in range(num_epochs):
         model.train()
@@ -103,10 +122,46 @@ def run_sft(
         history["train_loss"].append(avg_train_loss)
         history["val_loss"].append(avg_val_loss)
 
+        # Evaluate metrics if eval_dataset is provided
+        metrics = None
+        if eval_dataset is not None:
+            try:
+                # Convert torch.device to string for eval function
+                device_str = str(device) if isinstance(device, torch.device) else device
+                preds, refs = generate_summaries_batched(
+                    model, tokenizer, eval_dataset,
+                    text_key=text_key,
+                    ref_key=ref_key,
+                    device=device_str,
+                    batch_size=eval_batch_size,
+                    max_input_len=eval_max_input_len,
+                    max_new_tokens=eval_max_new_tokens,
+                    num_beams=eval_num_beams,
+                    do_sample=False,
+                )
+                metrics = metrics_table(preds, refs)
+                history["metrics"].append(metrics)
+            except Exception as e:
+                print(f"[SFT] Warning: Metrics evaluation failed: {e}")
+                history["metrics"].append(None)
+
+        # Print epoch summary
         print(
             f"[SFT] Epoch {epoch+1} done. "
             f"train_loss={avg_train_loss:.4f}  val_loss={avg_val_loss:.4f}"
         )
+        
+        # Print all metrics if available
+        if metrics is not None and print_metrics:
+            print(
+                f"[SFT] epoch={epoch+1}  "
+                f"ROUGE-1={metrics.get('rouge1', 0):.4f}  "
+                f"ROUGE-2={metrics.get('rouge2', 0):.4f}  "
+                f"ROUGE-L={metrics.get('rougeL', 0):.4f}  "
+                f"BLEU={metrics.get('bleu', 0):.4f}  "
+                f"Compression={metrics.get('compression', 0):.4f}  "
+                f"Repetition={metrics.get('repetition', 0):.4f}"
+            )
 
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)

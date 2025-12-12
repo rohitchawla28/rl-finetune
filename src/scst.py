@@ -18,16 +18,29 @@ import os
 import math
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 from transformers import T5ForConditionalGeneration, T5Tokenizer, PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 import evaluate
 
-def _collate_dicts(batch: List[Dict[str, str]]) -> List[Dict[str, str]]:
+class DictDataset(Dataset):
+    """Simple dataset wrapper for list of dictionaries."""
+    def __init__(self, data: List[Dict[str, str]]):
+        self.data = data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def _collate_dicts(batch):
     """
     Custom collate function for DataLoader that returns list of dicts as-is.
     PyTorch's default collate tries to collate dicts by key, which doesn't work for our use case.
     """
+    # DataLoader passes a list of items from the dataset
+    # Just return it as-is
     return batch
 
 # ---------- Data ----------
@@ -46,17 +59,45 @@ def build_scst_dataset(
     if dataset_name == "cnn_dailymail":
         raw = load_dataset("cnn_dailymail", "3.0.0", split="train").shuffle(seed=seed).select(range(n_train))
         def ok(ex):
+            # Ensure ex is a dict and has the required keys
+            if not isinstance(ex, dict):
+                return False
+            if "article" not in ex:
+                return False
             L = len(ex["article"])
             return (L >= min_len) and (L <= max_len)
         raw = raw.filter(ok)
-        return [{"article": ex["article"], "reference": ex["highlights"]} for ex in raw]
+        # Convert to list to ensure proper iteration
+        raw_list = list(raw)
+        result = []
+        for ex in raw_list:
+            if not isinstance(ex, dict):
+                raise TypeError(f"Expected dict, got {type(ex)}: {ex}")
+            if "article" not in ex or "highlights" not in ex:
+                raise KeyError(f"Missing keys in example. Keys: {list(ex.keys()) if isinstance(ex, dict) else 'N/A'}")
+            result.append({"article": ex["article"], "reference": ex["highlights"]})
+        return result
     elif dataset_name == "xsum":
         raw = load_dataset("xsum", split="train").shuffle(seed=seed).select(range(n_train))
         def ok(ex):
+            # Ensure ex is a dict and has the required keys
+            if not isinstance(ex, dict):
+                return False
+            if "document" not in ex:
+                return False
             L = len(ex["document"])
             return (L >= min_len) and (L <= max_len)
         raw = raw.filter(ok)
-        return [{"article": ex["document"], "reference": ex["summary"]} for ex in raw]
+        # Convert to list to ensure proper iteration
+        raw_list = list(raw)
+        result = []
+        for ex in raw_list:
+            if not isinstance(ex, dict):
+                raise TypeError(f"Expected dict, got {type(ex)}: {ex}")
+            if "document" not in ex or "summary" not in ex:
+                raise KeyError(f"Missing keys in example. Keys: {list(ex.keys()) if isinstance(ex, dict) else 'N/A'}")
+            result.append({"article": ex["document"], "reference": ex["summary"]})
+        return result
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -252,8 +293,10 @@ def run_scst(
         min_len=min_len,
         max_len=max_len,
     )
+    # Wrap data in a proper Dataset class for DataLoader
+    dataset = DictDataset(data)
     # Use custom collate function to return list of dicts as-is
-    dl = DataLoader(data, batch_size=batch_size, shuffle=True, collate_fn=_collate_dicts)
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate_dicts)
 
     # simple linear warmup + decay on token updates
     total_steps = epochs * math.ceil(len(data) / batch_size)
@@ -269,6 +312,23 @@ def run_scst(
         print(f"\n=== SCST Epoch {ep+1}/{epochs} ===")
         for batch in dl:
             step_idx += 1
+            # Debug: Check what batch actually is
+            if step_idx == 1 and debug:
+                print(f"[SCST DEBUG] Batch type: {type(batch)}")
+                print(f"[SCST DEBUG] Batch length: {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+                if isinstance(batch, list) and len(batch) > 0:
+                    print(f"[SCST DEBUG] First item type: {type(batch[0])}")
+                    if isinstance(batch[0], dict):
+                        print(f"[SCST DEBUG] First item keys: {list(batch[0].keys())}")
+            
+            # Ensure batch is a list of dicts
+            if not isinstance(batch, list):
+                raise TypeError(f"Expected batch to be a list, got {type(batch)}")
+            if len(batch) == 0:
+                continue
+            if not isinstance(batch[0], dict):
+                raise TypeError(f"Expected batch items to be dicts, got {type(batch[0])}. Batch[0] = {batch[0]}")
+            
             articles = [ex["article"] for ex in batch]
             refs     = [ex["reference"] for ex in batch]
 
