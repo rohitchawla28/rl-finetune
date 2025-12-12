@@ -23,6 +23,13 @@ from datasets import load_dataset
 from transformers import T5ForConditionalGeneration, T5Tokenizer, PreTrainedTokenizerBase, get_linear_schedule_with_warmup
 import evaluate
 
+def _collate_dicts(batch: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Custom collate function for DataLoader that returns list of dicts as-is.
+    PyTorch's default collate tries to collate dicts by key, which doesn't work for our use case.
+    """
+    return batch
+
 # ---------- Data ----------
 
 def build_scst_dataset(
@@ -245,7 +252,8 @@ def run_scst(
         min_len=min_len,
         max_len=max_len,
     )
-    dl = DataLoader(data, batch_size=batch_size, shuffle=True)
+    # Use custom collate function to return list of dicts as-is
+    dl = DataLoader(data, batch_size=batch_size, shuffle=True, collate_fn=_collate_dicts)
 
     # simple linear warmup + decay on token updates
     total_steps = epochs * math.ceil(len(data) / batch_size)

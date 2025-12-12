@@ -6,10 +6,24 @@ Copy this into a notebook cell to verify PPO is working.
 
 # Test PPO training - verify model weights change
 import torch
+import importlib
 from transformers import T5ForConditionalGeneration
+
+# Reload all modules to pick up code changes (important for development)
+import src.ppo
+import src.eval_utils
+import src.experiment_runner
+
+importlib.reload(src.ppo)
+importlib.reload(src.eval_utils)
+importlib.reload(src.experiment_runner)
+
+# Now import the functions after reloading
 from src.ppo import run_ppo
 from src.eval_utils import eval_model
 from src.experiment_runner import load_eval_dataset, get_dataset_keys
+
+print("✅ All modules reloaded and imported!")
 
 # 1. Load model and capture initial weights
 print("="*70)

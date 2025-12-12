@@ -67,42 +67,90 @@ def _to_1d_id_list(x):
         x = x[0]
     return list(x)
 
-def _ppo_generate(ppo_trainer: PPOTrainer, enc: Dict[str, torch.Tensor], **gen_kwargs):
+def _ppo_generate(ppo_trainer: PPOTrainer, queries: List[str], tokenizer: T5Tokenizer, device: str, debug: bool = False, **gen_kwargs):
     """
-    Optimized generation: Use model directly for faster batched generation.
-    TRL's generate can be slow, so we bypass it and use the underlying model.
-    Returns list[tensor] (one response per example) - only generated tokens.
+    Generate responses using the model directly.
+    Returns list[tensor] of generated token IDs (excluding input).
+    
+    For T5 (encoder-decoder): generate() returns decoder output which starts with
+    decoder_start_token_id, then the generated tokens.
     """
-    # Use the model directly for faster batched generation
+    # Get the base model (without value head) for generation
     model = ppo_trainer.model
     if hasattr(model, 'pretrained_model'):
-        model = model.pretrained_model  # Unwrap value head to get base model
+        model = model.pretrained_model
+    
+    # Encode queries (encoder input)
+    enc = tokenizer(queries, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
     
     model.eval()
     with torch.no_grad():
-        # Generate directly - much faster than TRL's generate
-        # For T5, generate() returns full sequence (input + generated)
+        # Generate - For T5, this returns decoder output: [decoder_start_token_id, generated_tokens...]
         outputs = model.generate(
             input_ids=enc["input_ids"],
             attention_mask=enc.get("attention_mask", None),
-            **gen_kwargs,
+            **gen_kwargs
         )
     
-    # Extract only the generated tokens (remove input prompt)
-    # T5 generate returns [input_ids, generated_ids], so we slice
-    input_len = enc["input_ids"].shape[1]
-    output_len = outputs.shape[1]
+    if debug:
+        print(f"[GEN DEBUG] Output shape: {outputs.shape}")
+        print(f"[GEN DEBUG] Input shape: {enc['input_ids'].shape}")
+        print(f"[GEN DEBUG] First output sample (first 20 tokens): {outputs[0][:20].cpu().tolist()}")
+        print(f"[GEN DEBUG] First input sample (first 20 tokens): {enc['input_ids'][0][:20].cpu().tolist()}")
     
-    # Handle case where output is same length as input (no generation happened)
-    if output_len <= input_len:
-        # Return empty tensors - this will be filtered out later
-        return [torch.tensor([], dtype=torch.long, device=outputs.device) for _ in range(outputs.size(0))]
+    # For T5 encoder-decoder models, generate() returns the decoder output
+    # which is independent of the encoder input length
+    # The output starts with decoder_start_token_id, then generated tokens
+    batch_size = outputs.size(0)
+    response_tensors = []
     
-    generated = outputs[:, input_len:].contiguous()
+    # Get decoder start token (usually pad_token_id for T5)
+    decoder_start_id = gen_kwargs.get('decoder_start_token_id', tokenizer.pad_token_id)
+    if decoder_start_id is None:
+        decoder_start_id = tokenizer.pad_token_id
     
-    # Return as list of tensors (one per example)
-    # Let decoding handle special tokens - don't filter here
-    return [generated[i] for i in range(generated.size(0))]
+    for i in range(batch_size):
+        output_seq = outputs[i].cpu()
+        
+        if debug and i < 2:
+            print(f"[GEN DEBUG] Sample {i}: output_len={len(output_seq)}")
+            print(f"[GEN DEBUG] Sample {i}: first 15 tokens={output_seq[:15].tolist()}")
+            print(f"[GEN DEBUG] Sample {i}: decoder_start_id={decoder_start_id}, eos_id={tokenizer.eos_token_id}, pad_id={tokenizer.pad_token_id}")
+        
+        # Skip decoder_start_token_id if present at the beginning
+        start_idx = 0
+        if len(output_seq) > 0:
+            first_token = output_seq[0].item()
+            if first_token == decoder_start_id:
+                start_idx = 1
+            elif debug and i < 2:
+                print(f"[GEN DEBUG] Sample {i}: First token {first_token} != decoder_start {decoder_start_id}")
+        
+        # Find where generation ends (first EOS or PAD after start)
+        end_idx = len(output_seq)
+        for j in range(start_idx, len(output_seq)):
+            token = output_seq[j].item()
+            if token == tokenizer.eos_token_id or token == tokenizer.pad_token_id:
+                end_idx = j
+                break
+        
+        # Extract generated tokens (between start_idx and end_idx)
+        if end_idx > start_idx:
+            generated = output_seq[start_idx:end_idx].clone()
+            response_tensors.append(generated)
+            
+            if debug and i < 2:
+                decoded = tokenizer.decode(generated.tolist(), skip_special_tokens=True)
+                print(f"[GEN DEBUG] Sample {i}: extracted {len(generated)} tokens")
+                print(f"[GEN DEBUG] Sample {i}: tokens={generated[:10].tolist()}")
+                print(f"[GEN DEBUG] Sample {i}: decoded='{decoded[:100]}'")
+        else:
+            # Empty generation
+            response_tensors.append(torch.tensor([], dtype=torch.long))
+            if debug and i < 2:
+                print(f"[GEN DEBUG] Sample {i}: EMPTY (start_idx={start_idx}, end_idx={end_idx}, output_len={len(output_seq)})")
+    
+    return response_tensors
 
 
 # ----------------------------
@@ -232,7 +280,7 @@ def run_ppo(
         reward_fn = lambda preds, refs, **kw: rouge_l_rewards(preds, refs, length_penalty=length_penalty)
     rw_kwargs = reward_kwargs or {}
 
-    # gen kwargs (passed to TRL)
+    # gen kwargs - ensure T5-compatible settings
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         min_new_tokens=min_new_tokens,
@@ -243,7 +291,19 @@ def run_ppo(
         no_repeat_ngram_size=no_repeat_ngram_size,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        use_cache=True,
     )
+    # T5 models need decoder_start_token_id - use pad_token_id if not set
+    if hasattr(model, 'pretrained_model') and hasattr(model.pretrained_model.config, 'decoder_start_token_id'):
+        if model.pretrained_model.config.decoder_start_token_id is not None:
+            gen_kwargs['decoder_start_token_id'] = model.pretrained_model.config.decoder_start_token_id
+        else:
+            gen_kwargs['decoder_start_token_id'] = tokenizer.pad_token_id
+    elif hasattr(model, 'config') and hasattr(model.config, 'decoder_start_token_id'):
+        if model.config.decoder_start_token_id is not None:
+            gen_kwargs['decoder_start_token_id'] = model.config.decoder_start_token_id
+        else:
+            gen_kwargs['decoder_start_token_id'] = tokenizer.pad_token_id
 
     # CSV logging
     csv_writer = None
@@ -282,122 +342,86 @@ def run_ppo(
             queries = [ex["query"] for ex in batch]
             refs    = [ex["reference"] for ex in batch]
 
-            # encode
-            enc = tokenizer(queries, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
-            _safe_isfinite("queries/input_ids", enc["input_ids"])
-
-            # generate via TRL (signature-safe)
-            responses = _ppo_generate(ppo_trainer, enc, **gen_kwargs)   # -> list[tensor]
-            for i, r in enumerate(responses):
-                _safe_isfinite(f"responses[{i}]", r)
-
-            # decode texts (force 1-D id lists)
-            decode_in = [_to_1d_id_list(r) for r in responses]
-            response_texts = tokenizer.batch_decode(decode_in, skip_special_tokens=True)
+            # Generate - enable debug on first step with high verbosity
+            debug_gen = (step_idx == 1 and V >= 2)
+            response_tensors = _ppo_generate(ppo_trainer, queries, tokenizer, device, debug=debug_gen, **gen_kwargs)
             
             # Debug: Print generation info on first step
             if step_idx == 1 and V >= 2:
-                print(f"[PPO DEBUG] Generated {len(responses)} responses")
-                for i, (resp_tensor, txt) in enumerate(zip(responses, response_texts)):
-                    resp_len = len(resp_tensor) if isinstance(resp_tensor, torch.Tensor) else len(resp_tensor)
-                    print(f"  Response {i}: len={resp_len}, text_len={len(txt)}, preview='{txt[:50]}...'")
+                print(f"[PPO DEBUG] Generated {len(response_tensors)} responses")
+                for i, resp in enumerate(response_tensors[:3]):
+                    resp_len = len(resp) if isinstance(resp, torch.Tensor) else len(resp)
+                    print(f"  Response {i}: len={resp_len}")
                     if resp_len > 0:
-                        print(f"    First 5 tokens: {resp_tensor[:5] if isinstance(resp_tensor, torch.Tensor) else resp_tensor[:5]}")
+                        tokens = resp.tolist() if isinstance(resp, torch.Tensor) else resp
+                        print(f"    First 5 tokens: {tokens[:5]}")
+                        # Also decode to see what it says
+                        text = tokenizer.decode(tokens, skip_special_tokens=True)
+                        print(f"    Decoded text: '{text[:100]}'")
             
-            # Filter out empty generations and handle them
-            valid_indices = []
-            valid_texts = []
-            valid_refs = []
-            valid_queries = []
-            valid_responses = []
-            valid_enc_input_ids = []
+            # Decode to text for reward computation
+            response_texts = []
+            for resp in response_tensors:
+                if isinstance(resp, torch.Tensor):
+                    tokens = resp.tolist()
+                else:
+                    tokens = list(resp) if resp else []
+                text = tokenizer.decode(tokens, skip_special_tokens=True)
+                response_texts.append(text)
             
-            for i, (txt, ref, q, resp) in enumerate(zip(response_texts, refs, queries, responses)):
-                if txt and txt.strip():  # Non-empty text
-                    valid_indices.append(i)
-                    valid_texts.append(txt)
-                    valid_refs.append(ref)
-                    valid_queries.append(q)
-                    valid_responses.append(resp)
-                    valid_enc_input_ids.append(enc["input_ids"][i])
+            # Filter out empty generations - but allow processing if we have at least one valid
+            valid_indices = [i for i, txt in enumerate(response_texts) if txt and txt.strip()]
             
-            if not valid_texts:
-                if V >= 2:
+            if not valid_indices:
+                if V >= 1:
                     print(f"[PPO] Warning: All generations empty at step {step_idx}, skipping batch")
                 if pbar is not None:
                     pbar.update(1)
                 continue
             
-            # Check if we have enough valid examples for the batch size
-            if len(valid_texts) < batch_size:
-                if V >= 2:
-                    print(f"[PPO] Warning: Only {len(valid_texts)} valid examples after filtering (need {batch_size}), skipping batch")
-                if pbar is not None:
-                    pbar.update(1)
-                continue
+            # Use only valid examples
+            if len(valid_indices) < len(queries):
+                if V >= 1:
+                    print(f"[PPO] Note: {len(queries) - len(valid_indices)} empty generations at step {step_idx}, using {len(valid_indices)} valid")
+                queries = [queries[i] for i in valid_indices]
+                refs = [refs[i] for i in valid_indices]
+                response_texts = [response_texts[i] for i in valid_indices]
+                response_tensors = [response_tensors[i] for i in valid_indices]
             
-            # Only process valid examples
-            if len(valid_texts) < len(response_texts):
-                if V >= 2:
-                    print(f"[PPO] Warning: {len(response_texts) - len(valid_texts)} empty generations at step {step_idx}")
-                # Update to only valid examples
-                queries = valid_queries
-                responses = valid_responses
-                refs = valid_refs
-                response_texts = valid_texts
-                # Re-encode only valid queries
-                enc = tokenizer(queries, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+            # Encode queries for PPO step
+            enc = tokenizer(queries, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+            query_tensors = [enc["input_ids"][i].clone().to(device) for i in range(enc["input_ids"].size(0))]
             
-            # Extract 1D query tensors (enc["input_ids"] is [batch_size, seq_len], so [i] gives 1D)
-            # Ensure they're on the correct device and have consistent dtype
-            query_tensors = []
-            for i in range(enc["input_ids"].size(0)):
-                q = enc["input_ids"][i].clone().to(device)
-                query_tensors.append(q)
-
-            # Ensure responses are 1D tensors (list of tensors, each 1D)
-            # All must be on same device with consistent dtype
-            response_tensors = []
-            for resp in responses:
+            # Ensure response tensors are 1D and on correct device
+            response_tensors_clean = []
+            for resp in response_tensors:
                 if torch.is_tensor(resp):
-                    # Flatten to 1D if needed
                     if resp.ndim == 0:
                         resp = resp.unsqueeze(0)
                     elif resp.ndim > 1:
                         resp = resp.view(-1)
-                    # Ensure correct device and dtype
-                    resp = resp.clone().detach().to(device).long()
-                    response_tensors.append(resp)
+                    resp = resp.to(device).long()
                 elif isinstance(resp, (list, tuple)):
-                    # Convert list to 1D tensor
-                    response_tensors.append(torch.tensor(resp, dtype=torch.long, device=device))
+                    resp = torch.tensor(resp, dtype=torch.long, device=device)
                 else:
-                    # Single value
-                    response_tensors.append(torch.tensor([resp], dtype=torch.long, device=device))
-
-            # Final safety check: ensure we have exactly batch_size examples
-            if len(query_tensors) != batch_size or len(response_tensors) != batch_size:
-                if V >= 2:
-                    print(f"[PPO] Warning: Mismatch - queries={len(query_tensors)}, responses={len(response_tensors)}, batch_size={batch_size}, skipping")
-                if pbar is not None:
-                    pbar.update(1)
-                continue
-
-            # rewards
+                    resp = torch.tensor([resp] if resp else [], dtype=torch.long, device=device)
+                response_tensors_clean.append(resp)
+            
+            # Compute rewards
             rewards = reward_fn(response_texts, refs, **rw_kwargs)
             rewards = [torch.clamp(r.float(), -reward_clamp, reward_clamp) for r in rewards]
             rewards = [torch.where(torch.isfinite(r), r, torch.zeros_like(r)) for r in rewards]
             
-            # Final check: rewards must match batch size
-            if len(rewards) != batch_size:
-                if V >= 2:
-                    print(f"[PPO] Warning: Rewards count ({len(rewards)}) != batch_size ({batch_size}), skipping")
+            # PPO update - TRL handles variable batch sizes
+            try:
+                stats = ppo_trainer.step(query_tensors, response_tensors_clean, rewards)
+            except Exception as e:
+                if V >= 1:
+                    print(f"[PPO] Error in step(): {e}")
+                    print(f"[PPO] Batch size: {len(query_tensors)}, rewards: {len(rewards)}")
                 if pbar is not None:
                     pbar.update(1)
                 continue
-
-            # PPO update - pass 1D tensors
-            stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
             mean_reward = torch.stack(rewards).mean().item()
             
             # Debug: Print stats on first and last step to verify training
