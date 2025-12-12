@@ -9,6 +9,16 @@ from transformers import T5Tokenizer, T5ForConditionalGeneration, PreTrainedMode
 _ROUGE = evaluate.load("rouge")
 _BLEU  = evaluate.load("bleu")
 
+
+def get_dataset_keys(dataset_name: str) -> tuple:
+    """Get text_key and ref_key for a dataset."""
+    if dataset_name == "cnn_dailymail":
+        return "article", "highlights"
+    elif dataset_name == "xsum":
+        return "document", "summary"
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
 @torch.no_grad()
 def generate_summaries_batched(
     model: PreTrainedModel,
